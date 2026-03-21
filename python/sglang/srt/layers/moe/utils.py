@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Optional
+
+import torch
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -23,7 +25,10 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
+    NIXL = "nixl"
+    MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
+    FLASHINFER = "flashinfer"
 
     @classmethod
     def _missing_(cls, value):
@@ -43,8 +48,17 @@ class MoeA2ABackend(Enum):
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
 
+    def is_nixl(self):
+        return self == MoeA2ABackend.NIXL
+
+    def is_flashinfer(self):
+        return self == MoeA2ABackend.FLASHINFER
+
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
+
+    def is_mori(self):
+        return self == MoeA2ABackend.MORI
 
 
 class MoeRunnerBackend(Enum):
@@ -54,6 +68,7 @@ class MoeRunnerBackend(Enum):
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
@@ -74,6 +89,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_trtllm(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM
+
+    def is_flashinfer_trtllm_routed(self):
+        return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
 
     def is_flashinfer_cutlass(self):
         return self == MoeRunnerBackend.FLASHINFER_CUTLASS
@@ -181,10 +199,6 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
 def get_moe_runner_backend() -> MoeRunnerBackend:
     global MOE_RUNNER_BACKEND
     if MOE_RUNNER_BACKEND is None:
-        log_info_on_rank0(
-            logger,
-            "MOE_RUNNER_BACKEND is not initialized, the backend will be automatically selected",
-        )
         MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return MOE_RUNNER_BACKEND
 
@@ -266,6 +280,7 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
     """
     return (
         not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+        and get_moe_a2a_backend().is_none()
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
         and MOE_QUANTIZATION == "modelopt_fp4"
@@ -329,3 +344,30 @@ class RoutingMethodType(IntEnum):
     TopK = (5,)
     # Unspecified
     Unspecified = 6
+
+
+def get_moe_padding_size(is_aiter_moe):
+    if is_aiter_moe:
+        return 128
+    else:
+        return 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+
+
+def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
+    w13_up_dim = 2 * inter_dim if is_concat else inter_dim
+    w2_down_dim = inter_dim // 2 if is_packed else inter_dim
+
+    if is_aiter_moe:
+        padding_size = get_moe_padding_size(True)
+        align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+        is_padded = (w2_down_dim % padding_size) > 0
+        if is_padded:
+            w2_down_dim = align_aiter(w2_down_dim)
+        # up proj + gate fusion : 2x
+        if is_concat:
+            w13_up_dim = w2_down_dim * 2
+        # packed
+        if hasattr(torch, "float4_e2m1fn_x2") and is_packed:
+            w13_up_dim *= 2
+
+    return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)

@@ -22,7 +22,18 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sgl_kernel.flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_fa3
+from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_fa3
+
+flash_attn_varlen_func = flash_attn_varlen_func_fa3
+flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
+
+from sglang.jit_kernel.flash_attention_v4 import (
+    flash_attn_varlen_func as flash_attn_varlen_func_fa4,
+)
+from sglang.jit_kernel.flash_attention_v4 import (
+    flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
+)
 
 
 @dataclass
@@ -803,10 +814,21 @@ class FlashAttentionBackend(AttentionBackend):
             and not is_swa_layer
         )
 
-        # For fa3 interface version compatibility, we put new fields into conditional keyword args
+        flash_attn_varlen_func_base = flash_attn_varlen_func_fa3
+        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
+
+        flash_attn_varlen_func = (
+            flash_attn_varlen_func_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_varlen_func_base
+        )
+        flash_attn_with_kvcache = (
+            flash_attn_with_kvcache_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_with_kvcache_base
+        )
+
         kwargs = {}
-        if self.fa_impl_ver != 3:
-            kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
 
@@ -1110,12 +1132,17 @@ class FlashAttentionBackend(AttentionBackend):
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
-        # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
-        if self.fa_impl_ver != 3:
-            kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
+
+        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
+
+        flash_attn_with_kvcache = (
+            flash_attn_with_kvcache_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_with_kvcache_base
+        )
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
@@ -1507,6 +1534,20 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             }
 
+            if self.use_sliding_window_kv_pool:
+                self.target_verify_metadata["swa_page_table"] = torch.zeros(
+                    max_bs,
+                    max_num_pages,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.draft_extend_metadata["swa_page_table"] = torch.zeros(
+                    max_bs,
+                    max_num_pages,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+
         if self.topk > 1:
             self.target_verify_metadata_topk_normal = {
                 "cache_seqlens": torch.zeros(
@@ -1641,6 +1682,10 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table = self.decode_cuda_graph_metadata[
                         "page_table_draft_decode"
                     ][:bs, :]
+                    if self.use_sliding_window_kv_pool:
+                        metadata.swa_page_table = self.decode_cuda_graph_metadata[
+                            "swa_page_table"
+                        ][:bs, :]
                     self.decode_cuda_graph_metadata[bs] = metadata
                 else:
                     # When top k > 1, we need two specific draft decode metadata, and then merge states
@@ -1737,6 +1782,11 @@ class FlashAttentionBackend(AttentionBackend):
 
                 metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
 
+                if self.use_sliding_window_kv_pool:
+                    metadata.swa_page_table = self.target_verify_metadata[
+                        "swa_page_table"
+                    ][:bs, :]
+
                 self.target_verify_metadata[bs] = metadata
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
@@ -1821,6 +1871,11 @@ class FlashAttentionBackend(AttentionBackend):
             ]
             metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
 
+            if self.use_sliding_window_kv_pool:
+                metadata.swa_page_table = self.draft_extend_metadata["swa_page_table"][
+                    :bs, :
+                ]
+
             self.draft_extend_metadata[bs] = metadata
 
         if encoder_lens is not None:
@@ -1883,6 +1938,12 @@ class FlashAttentionBackend(AttentionBackend):
                         seq_lens,
                         self.speculative_step_id + 1,
                         self.page_size,
+                        metadata.swa_page_table,
+                        (
+                            self.token_to_kv_pool
+                            if self.use_sliding_window_kv_pool
+                            else None
+                        ),
                     )
 
                 else:
@@ -1979,6 +2040,18 @@ class FlashAttentionBackend(AttentionBackend):
                     req_pool_indices[:, None],
                     self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
                 ]
+                if (
+                    self.use_sliding_window_kv_pool
+                    and metadata.swa_page_table is not None
+                ):
+                    swa_page_indices = (
+                        self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            page_indices
+                        )
+                    )
+                    metadata.swa_page_table[:, :max_seq_pages].copy_(
+                        swa_page_indices // self.page_size
+                    )
                 page_indices //= self.page_size
                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
             else:
@@ -2094,6 +2167,13 @@ class FlashAttentionBackend(AttentionBackend):
                 req_pool_indices[:, None],
                 self.draft_extend_metadata["strided_indices"][:max_seq_pages],
             ]
+            if self.use_sliding_window_kv_pool and metadata.swa_page_table is not None:
+                swa_page_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    page_indices
+                )
+                metadata.swa_page_table[:, :max_seq_pages].copy_(
+                    swa_page_indices // self.page_size
+                )
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
 
         elif forward_mode.is_draft_extend_v2():
@@ -2117,7 +2197,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 default_extend = getattr(
-                    spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
+                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
                 )
                 extend_seq_lens = torch.full(
                     (bs,), default_extend, dtype=torch.int32, device=device
@@ -2128,7 +2208,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
             else:
                 metadata.max_seq_len_q = getattr(
-                    spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
+                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
                 )
 
             metadata.cu_seqlens_q[1:].copy_(
@@ -2142,6 +2222,13 @@ class FlashAttentionBackend(AttentionBackend):
                 req_pool_indices[:, None],
                 self.draft_extend_metadata["strided_indices"][:max_seq_pages],
             ]
+            if self.use_sliding_window_kv_pool and metadata.swa_page_table is not None:
+                swa_page_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    page_indices
+                )
+                metadata.swa_page_table[:, :max_seq_pages].copy_(
+                    swa_page_indices // self.page_size
+                )
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
 
         if encoder_lens is not None:
