@@ -59,13 +59,6 @@ class LoRAConfig:
             len(self.added_tokens_config) if self.added_tokens_config is not None else 0
         )
 
-        if self.lora_added_tokens_size > 0:
-            raise ValueError(
-                f"LoRA adapter has {self.lora_added_tokens_size} added tokens, "
-                f"but added tokens are not supported yet. "
-                f"Added tokens: {self.added_tokens_config}"
-            )
-
     @classmethod
     def from_dict(
         cls,
