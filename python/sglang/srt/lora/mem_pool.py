@@ -436,35 +436,50 @@ class LoRAMemoryPool:
         if not missing_uids:
             return
 
-        # Initialize eviction candidates only when we know we have no more free slots
-        eviction_candidates = None
+        candidates = self._build_eviction_candidates(cur_uids, lora_refs)
 
         for uid in missing_uids:
             if self.free_slots:
-                buffer_id = self.free_slots.pop()
+                empty_buffer_id = self.free_slots.pop()
             else:
-                if eviction_candidates is None:
-                    eviction_candidates = self._build_eviction_candidates(
-                        cur_uids, lora_refs
+                if not candidates:
+                    raise ValueError(
+                        "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
                     )
-                    if not eviction_candidates:
-                        raise ValueError(
-                            "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
-                        )
 
-                buffer_id = self._evict_one(eviction_candidates)
+                # Prefer evicting LoRA adapters over the base model (None).
+                # Only evict None when the batch consists entirely of LoRA requests
+                # and no other adapters can be evicted.
+                non_none_candidates = candidates - {None}
+                if non_none_candidates:
+                    candidates_to_use = non_none_candidates
+                else:
+                    candidates_to_use = candidates
+
+                # Select victim using eviction policy
+                victim_uid = self.eviction_policy.select_victim(candidates_to_use)
+                empty_buffer_id = self.uid_to_buffer_id.pop(victim_uid)
+
+                # Update bookkeeping
+                self.eviction_policy.remove(victim_uid)
+                self.buffer_id_to_uid[empty_buffer_id] = EMPTY_SLOT
+                candidates.discard(victim_uid)
+
+                logger.debug(
+                    f"Evicting LoRA {victim_uid} from buffer slot {empty_buffer_id}."
+                )
 
             lora_adapter = lora_adapters.get(uid)
             self.load_lora_weight_to_buffer(
                 uid,
-                buffer_id,
+                empty_buffer_id,
                 lora_adapter,
                 lora_modules,
                 lora_embed_tokens_module,
                 lora_lm_head_module,
             )
-            self.uid_to_buffer_id[uid] = buffer_id
-            self.buffer_id_to_uid[buffer_id] = uid
+            self.uid_to_buffer_id[uid] = empty_buffer_id
+            self.buffer_id_to_uid[empty_buffer_id] = uid
 
     def _build_eviction_candidates(
         self,
@@ -485,21 +500,6 @@ class LoRAMemoryPool:
             candidates.add(uid)
 
         return candidates
-
-    def _evict_one(self, candidates: Set[Optional[str]]) -> int:
-        # Prefer evicting actual LoRA adapters over the base model (None).
-        # Only evict None when no other adapters can be evicted.
-        non_none_candidates = candidates - {None}
-        candidates_to_use = non_none_candidates if non_none_candidates else candidates
-
-        victim_uid = self.eviction_policy.select_victim(candidates_to_use)
-        victim_buffer_id = self.uid_to_buffer_id.pop(victim_uid)
-        self.eviction_policy.remove(victim_uid)
-        self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
-        candidates.discard(victim_uid)
-
-        logger.debug(f"Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}.")
-        return victim_buffer_id
 
     def load_lora_weight_to_buffer(
         self,
