@@ -4966,6 +4966,15 @@ class ServerArgs:
             help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
         )
         parser.add_argument(
+            "--experts-shared-outer-loras",
+            default=ServerArgs.experts_shared_outer_loras,
+            action=argparse.BooleanOptionalAction,
+            help="Force shared outer LoRA mode for MoE models. "
+            "When set, w1/w3 lora_A and w2 lora_B are shared across experts "
+            "(expert_dim=1). Use --no-experts-shared-outer-loras to force disable. "
+            "By default this is auto-detected from adapter weights.",
+        )
+        parser.add_argument(
             "--lora-use-virtual-experts",
             default=ServerArgs.lora_use_virtual_experts,
             action="store_true",
@@ -4983,13 +4992,6 @@ class ServerArgs:
             type=float,
             default=ServerArgs.lora_drain_wait_threshold,
             help="When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
-            "--experts-shared-outer-loras",
-            default=ServerArgs.experts_shared_outer_loras,
-            action=argparse.BooleanOptionalAction,
-            help="Force shared outer LoRA mode for MoE models. "
-            "When set, w1/w3 lora_A and w2 lora_B are shared across experts "
-            "(expert_dim=1). Use --no-experts-shared-outer-loras to force disable. "
-            "By default this is auto-detected from adapter weights.",
         )
 
         # Kernel backend
@@ -6733,7 +6735,7 @@ class ServerArgs:
                     f"Got: {self.lora_backend}"
                 )
                 logger.info("Virtual expert computation enabled.")
-                
+
             assert (
                 self.lora_drain_wait_threshold >= 0.0
             ), "--lora-drain-wait-threshold must be non-negative."
